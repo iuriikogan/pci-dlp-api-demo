@@ -9,10 +9,11 @@ from apache_beam.options.pipeline_options import PipelineOptions
 from google.cloud import dlp_v2
 
 class DeidentifyCSVFn(beam.DoFn):
-    def __init__(self, project_id, kms_key_name, wrapped_key):
+    def __init__(self, project_id, kms_key_name, wrapped_key, headers):
         self.project_id = project_id
         self.kms_key_name = kms_key_name
         self.wrapped_key = wrapped_key
+        self.headers = headers
         self.dlp_client = None
 
     def start_bundle(self):
@@ -22,22 +23,20 @@ class DeidentifyCSVFn(beam.DoFn):
     def process(self, batch):
         if not batch:
             return
-            
-        headers = list(batch[0].keys())
 
         try:
             parent = f"projects/{self.project_id}/locations/global"
             
+            # 1. Parse raw CSV lines into Table cells dynamically
             rows = []
-            for row in batch:
-                # .strip() removes invisible \r, \n, and accidental spaces
-                cells = [{"string_value": str(row[header]).strip()} for header in headers]
+            for line in batch:
+                parsed_line = next(csv.reader([line]))
+                cells = [{"string_value": str(val).strip()} for val in parsed_line]
                 rows.append({"values": cells})
             
-            table = {"headers": [{"name": h} for h in headers], "rows": rows}
+            table = {"headers": [{"name": h} for h in self.headers], "rows": rows}
 
-            # Max out the alphabet to the FFX limit (94 characters)
-            # This includes all letters, numbers, punctuation, and a space.
+            # 2. Bulletproof Alphabets
             bulletproof_alphabet = string.ascii_letters + string.digits + string.punctuation + " "
 
             crypto_config_numeric = {
@@ -64,29 +63,42 @@ class DeidentifyCSVFn(beam.DoFn):
                 }
             }
 
-            transformations = [
-                {"fields": [{"name": "first_name"}, {"name": "last_name"}, {"name": "email"}], "primitive_transformation": crypto_config_alphanumeric},
-                {"fields": [{"name": "credit_card"}, {"name": "ssn"}, {"name": "phone_number"}], "primitive_transformation": crypto_config_numeric},
-                {
-                    "fields": [{"name": "customer_notes"}],
-                    "info_type_transformations": {
-                        "transformations": [{
-                            "info_types": [{"name": "EMAIL_ADDRESS"}, {"name": "PHONE_NUMBER"}, {"name": "PERSON_NAME"}],
-                            "primitive_transformation": crypto_config_alphanumeric
-                        }]
-                    }
-                }
-            ]
+            # 3. DYNAMIC DISCOVERY: Define what the engine should hunt for
+            inspect_config = {
+                "info_types": [
+                    {"name": "EMAIL_ADDRESS"},
+                    {"name": "PERSON_NAME"},
+                    {"name": "CREDIT_CARD_NUMBER"},
+                    {"name": "US_SOCIAL_SECURITY_NUMBER"},
+                    {"name": "PHONE_NUMBER"}
+                ]
+            }
 
+            # 4. Map the discovered InfoTypes to the correct FPE alphabet
+            info_type_transformations = {
+                "transformations": [
+                    {
+                        "info_types": [{"name": "EMAIL_ADDRESS"}, {"name": "PERSON_NAME"}],
+                        "primitive_transformation": crypto_config_alphanumeric
+                    },
+                    {
+                        "info_types": [{"name": "CREDIT_CARD_NUMBER"}, {"name": "US_SOCIAL_SECURITY_NUMBER"}, {"name": "PHONE_NUMBER"}],
+                        "primitive_transformation": crypto_config_numeric
+                    }
+                ]
+            }
+
+            # 5. Call the API using BOTH inspect_config and deidentify_config
             response = self.dlp_client.deidentify_content(
                 request={
                     "parent": parent,
-                    "deidentify_config": {"record_transformations": {"field_transformations": transformations}},
+                    "inspect_config": inspect_config,
+                    "deidentify_config": {"info_type_transformations": info_type_transformations},
                     "item": {"table": table},
                 }
             )
 
-            # 1. MAIN OUTPUT: Yield masked rows normally
+            # MAIN OUTPUT: Yield masked rows
             resp_table = response.item.table
             for row in resp_table.rows:
                 values = [cell.string_value for cell in row.values]
@@ -97,12 +109,9 @@ class DeidentifyCSVFn(beam.DoFn):
 
         except Exception as e:
             logging.error(f"Routing batch to DLQ due to DLP API Error: {e}")
-            # 2. DLQ OUTPUT: Yield the original, unmasked rows using a TaggedOutput
-            for row in batch:
-                output = io.StringIO()
-                writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
-                writer.writerow([row[h] for h in headers])
-                yield beam.pvalue.TaggedOutput('dlq', output.getvalue().strip())
+            # DLQ OUTPUT: Yield the original, unmasked rows
+            for line in batch:
+                yield beam.pvalue.TaggedOutput('dlq', line)
 
 
 def run():
@@ -115,6 +124,10 @@ def run():
     parser.add_argument("--kms_key_name", required=True)
     parser.add_argument("--wrapped_key", required=True)
     parser.add_argument("--requirements_file", default="./requirements.txt")
+    
+    # New argument to make the script completely agnostic
+    parser.add_argument("--csv_headers", required=True, help="Comma-separated list of headers in the CSV")
+    
     known_args, pipeline_args = parser.parse_known_args()
 
     pipeline_options = PipelineOptions(
@@ -125,13 +138,14 @@ def run():
         save_main_session=True
     )
 
-    headers = ["transaction_id", "first_name", "last_name", "email", "phone_number", "ssn", "credit_card", "customer_notes"]
+    # Convert the string of headers into a Python list
+    headers = known_args.csv_headers.split(",")
 
     with beam.Pipeline(options=pipeline_options) as p:
         batched_data = (
             p
             | "ReadCSV" >> beam.io.ReadFromText(known_args.input_bucket, skip_header_lines=1)
-            | "ParseToDict" >> beam.Map(lambda line: dict(zip(headers, next(csv.reader([line])))))
+            # Notice we removed the ParseToDict step to save CPU. We just batch the raw lines!
             | "BatchRows" >> beam.BatchElements(min_batch_size=10, max_batch_size=100)
         )
 
@@ -140,7 +154,8 @@ def run():
             | "Deidentify" >> beam.ParDo(DeidentifyCSVFn(
                 project_id=known_args.project,
                 kms_key_name=known_args.kms_key_name,
-                wrapped_key=known_args.wrapped_key
+                wrapped_key=known_args.wrapped_key,
+                headers=headers # Pass the dynamic headers into the worker
             )).with_outputs('dlq', main='main_output')
         )
 
@@ -149,7 +164,7 @@ def run():
             | "WriteSuccessToGCS" >> beam.io.WriteToText(
                 known_args.output_bucket, 
                 file_name_suffix=".csv",
-                header=",".join(headers)
+                header=",".join(headers) # Inject the dynamic headers into every output file
             )
         )
 

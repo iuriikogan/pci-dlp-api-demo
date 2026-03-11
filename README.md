@@ -113,7 +113,7 @@ Deploy the Apache Beam pipeline to Dataflow. We pass the `requirements.txt` file
 python deidentify.py \
   --input_bucket gs://$BUCKET_NAME/input/*.csv \
   --output_bucket gs://$BUCKET_NAME/output/results \
-  --dlq_bucket gs://$SECURE_DLQ_BUCKET/dlq_results \
+  --dlq_bucket gs://your-secure-dlq-bucket/dlq_results \
   --project $PROJECT_ID \
   --region $REGION \
   --runner DataflowRunner \
@@ -121,7 +121,8 @@ python deidentify.py \
   --staging_location gs://$BUCKET_NAME/staging \
   --kms_key_name $KMS_KEY_NAME \
   --wrapped_key $WRAPPED_KEY \
-  --requirements_file ./requirements.txt
+  --requirements_file ./requirements.txt \
+  --csv_headers "transaction_id,first_name,last_name,email,phone_number,ssn,credit_card,customer_notes"
 ```
 
 ## Step 5: Monitor Execution
