@@ -1,0 +1,4 @@
+--extra-index-url https://pypi.org/simple/
+google-cloud-dlp
+google-cloud-kms
+apache-beam[gcp]
